@@ -6,14 +6,6 @@ Dependencies in PRL:
 * NONE
 """
 
-# TODO
-import os
-import subprocess
-import psutil
-import signal
-import importlib
-import inspect
-
 
 __author__ = "Brian Delhaisse"
 __copyright__ = "Copyright 2019, PyRoboLearn"
@@ -25,13 +17,30 @@ __email__ = "briandelhaisse@gmail.com"
 __status__ = "Development"
 
 
-class MiddleWare(object):
+class Middleware(object):
     r"""Middleware (abstract) class
 
-    Middlewares can be provided to simulators which can then use them to send/receive messages.
+    Middleware can be provided to simulators which can then use them to send/receive messages.
+
+    Here are the possible combinations between the different values for subscribe (S), publish (P), teleoperate (T),
+    and command (C):
+
+    - S=1, P=0, T=0: subscribes to the topics, and get the messages when calling the corresponding getter methods.
+    - S=0, P=1, T=0: publishes the various messages to the topics when calling the corresponding setter methods.
+    - S=1, P=0, T=1, C=0/1: get messages by subscribing to the topics that publish some commands/states. The
+      received commands/states are then set in the simulator. Depending on the value of `C`, it will subscribe to
+      topics that publish some commands (C=1) or states (C=0). Example: should we subscribe to joint trajectory
+      commands, or joint states when teleoperating the robot in the simulator? This C value allows to specify
+      which one we are interested in.
+    - S=0, P=1, T=1: when calling the getters methods such as joint positions, velocities, and others, it also
+      publishes the joint states. This is useful if we are moving/teleoperating the robot in the simulator.
+    - S=0, P=0, T=1/0: doesn't do anything.
+    - S=1, P=1, T=0: subscribes to some topics and publish messages to other topics. The messages are can be
+      sent/received by calling the appropriate getter/setter methods.
+    - S=1, P=1, T=1: not allowed, because teleoperating the robot is not a two-way communication process.
     """
 
-    def __init__(self, subscribe=False, publish=False, teleoperate=False):
+    def __init__(self, subscribe=False, publish=False, teleoperate=False, command=True):
         """
         Initialize the middleware to communicate.
 
@@ -41,43 +50,193 @@ class MiddleWare(object):
             publish (bool): if True, it will publish the given values to the topics associated to the loaded robots.
             teleoperate (bool): if True, it will move the robot based on the received or sent values based on the 2
               previous attributes :attr:`subscribe` and :attr:`publish`.
+            command (bool): if True, it will subscribe to the joint commands. If False, it will subscribe to the
+              joint states.
         """
         # set variables
-        self.subscribe = subscribe
-        self.publish = publish
-        self.teleoperate = teleoperate
+        # self.is_subscribing = subscribe
+        # self.is_publishing = publish
+        # self.is_teleoperating = teleoperate
+        # self.is_commanding = command
+        self._subscribe, self._publish, self._teleoperate, self._command = False, False, False, False
+        self._robots = {}  # {body_id: RobotMiddleware}
+        self.switch_mode(subscribe=subscribe, publish=publish, teleoperate=teleoperate, command=command)
 
     ##############
     # Properties #
     ##############
 
     @property
-    def subscribe(self):
+    def is_subscribing(self):
         return self._subscribe
 
-    @subscribe.setter
-    def subscribe(self, subscribe):
-        self._subscribe = bool(subscribe)
+    # @is_subscribing.setter
+    # def is_subscribing(self, subscribe):
+    #     self._subscribe = bool(subscribe)
 
     @property
-    def publish(self):
+    def is_publishing(self):
         return self._publish
 
-    @publish.setter
-    def publish(self, publish):
-        self._publish = bool(publish)
+    # @is_publishing.setter
+    # def is_publishing(self, publish):
+    #     self._publish = bool(publish)
 
     @property
-    def teleoperate(self):
+    def is_teleoperating(self):
         return self._teleoperate
 
-    @teleoperate.setter
-    def teleoperate(self, teleoperate):
-        self._teleoperate = bool(teleoperate)
+    # @is_teleoperating.setter
+    # def is_teleoperating(self, teleoperate):
+    #     self._teleoperate = bool(teleoperate)
+
+    @property
+    def is_commanding(self):
+        return self._command
+
+    # @is_commanding.setter
+    # def is_commanding(self, command):
+    #     self._command = bool(command)
+
+    # aliases
+    subscribe = is_subscribing
+    publish = is_publishing
+    teleoperate = is_teleoperating
+    command = is_commanding
+
+    #############
+    # Operators #
+    #############
+
+    def __str__(self):
+        """Return a readable string about the class."""
+        return self.__class__.__name__
+
+    def __del__(self):
+        """Close/Delete the simulator."""
+        self.close()
+
+    def __copy__(self):
+        """Return a shallow copy of the middleware. This can be overridden in the child class."""
+        return self.__class__(subscribe=self.is_subscribing, publish=self.is_publishing,
+                              teleoperate=self.is_teleoperating)
+
+    def __deepcopy__(self, memo={}):
+        """Return a deep copy of the middleware. This can be overridden in the child class.
+
+        Args:
+            memo (dict): memo dictionary of objects already copied during the current copying pass.
+        """
+        # if the object has already been copied return the reference to the copied object
+        if self in memo:
+            return memo[self]
+
+        # create a new copy of the simulator
+        middleware = self.__class__(subscribe=self.is_subscribing, publish=self.is_publishing,
+                                    teleoperate=self.is_teleoperating)
+
+        memo[self] = middleware
+        return middleware
 
     ###########
     # Methods #
     ###########
+
+    def switch_mode(self, body_id=None, subscribe=None, publish=None, teleoperate=None, command=None):
+        """
+        Switch middleware mode.
+
+        Here are the possible combinations between the different values for subscribe (S), publish (P),
+        teleoperate (T), and command (C):
+
+        - S=1, P=0, T=0: subscribes to the topics, and get the messages when calling the corresponding getter methods.
+        - S=0, P=1, T=0: publishes the various messages to the topics when calling the corresponding setter methods.
+        - S=1, P=0, T=1, C=0/1: get messages by subscribing to the topics that publish some commands/states. The
+          received commands/states are then set in the simulator. Depending on the value of `C`, it will subscribe to
+          topics that publish some commands (C=1) or states (C=0). Example: should we subscribe to joint trajectory
+          commands, or joint states when teleoperating the robot in the simulator? This C value allows to specify
+          which one we are interested in.
+        - S=0, P=1, T=1: when calling the getters methods such as joint positions, velocities, and others, it also
+          publishes the joint states. This is useful if we are moving/teleoperating the robot in the simulator.
+        - S=0, P=0, T=1/0: doesn't do anything.
+        - S=1, P=1, T=0: subscribes to some topics and publish messages to other topics. The messages are can be
+          sent/received by calling the appropriate getter/setter methods.
+        - S=1, P=1, T=1: not allowed, because teleoperating the robot is not a two-way communication process.
+
+        Args:
+            body_id (int): unique body id to switch the mode.
+            subscribe (bool): if True, it will subscribe to the topics associated to the loaded robots, and will read
+              the values published on these topics.
+            publish (bool): if True, it will publish the given values to the topics associated to the loaded robots.
+            teleoperate (bool): if True, it will move the robot based on the received or sent values based on the 2
+              previous attributes :attr:`subscribe` and :attr:`publish`.
+            command (bool): if True, it will subscribe to the joint commands. If False, it will subscribe to the
+              joint states.
+        """
+        if body_id is None:
+            if subscribe is None:
+                subscribe = self.subscribe
+            if publish is None:
+                publish = self.publish
+            if teleoperate is None:
+                teleoperate = self.teleoperate
+            if command is None:
+                command = self.command
+
+            if teleoperate and publish and subscribe:
+                raise ValueError("The three following arguments 'subscribe', 'publish', and 'teleoperate' can not be "
+                                 "all true at the same time. Select maximum two to be set to True (see method "
+                                 "documentation).")
+
+            self._subscribe = bool(subscribe)
+            self._publish = bool(publish)
+            self._teleoperate = bool(teleoperate)
+            self._command = bool(command)
+
+            for robot in self._robots.values():
+                robot.switch_mode(subscribe=self._subscribe, publish=self._publish, teleoperate=self._teleoperate,
+                                  command=self._command)
+
+    def close(self):
+        """
+        Close the middleware.
+        """
+        pass
+
+    def reset(self):
+        """
+        Reset the middleware.
+        """
+        pass
+
+    def get_robot_middleware(self, robot_id):
+        r"""
+        Get the robot middleware associated with the given robot id.
+
+        Args:
+            robot_id (int): robot unique id.
+
+        Returns:
+            RobotMiddleware, None: robot middleware. None if it could not find the associated robot midddleware.
+        """
+        pass
+
+    def load_urdf(self, urdf):
+        """Load the given URDF file.
+
+        The load_urdf will send a command to the physics server to load a physics model from a Universal Robot
+        Description File (URDF). The URDF file is used by the ROS project (Robot Operating System) to describe robots
+        and other objects, it was created by the WillowGarage and the Open Source Robotics Foundation (OSRF).
+        Many robots have public URDF files, you can find a description and tutorial here:
+        http://wiki.ros.org/urdf/Tutorials
+
+        Args:
+            urdf (str): a relative or absolute path to the URDF file on the file system of the physics server.
+
+        Returns:
+            int (non-negative): unique id associated to the load model.
+        """
+        pass
 
     def has_sensor(self, body_id, name):
         """
@@ -102,6 +261,21 @@ class MiddleWare(object):
 
         Returns:
             np.array, dict, list, None: sensor values. None if it didn't have anything.
+        """
+        pass
+
+    def reset_joint_states(self, body_id, joint_ids, positions, velocities=None):
+        """
+        Reset the joint states. It is best only to do this at the start, while not running the simulation:
+        `reset_joint_state` overrides all physics simulation.
+
+        Args:
+            body_id (int): unique body id.
+            joint_ids (int, list[int]): joint indices where each joint index is between [0..num_joints(body_id)]
+            positions (float, list[float], np.array[float]): the joint position(s) (angle in radians [rad] or
+              position [m])
+            velocities (float, list[float], np.array[float]): the joint velocity(ies) (angular [rad/s] or linear
+              velocity [m/s])
         """
         pass
 

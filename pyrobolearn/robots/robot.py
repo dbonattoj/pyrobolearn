@@ -333,6 +333,19 @@ class Robot(ControllableBody):
             for actuator in actuators:
                 actuator()
 
+    ##############
+    # Middleware #
+    ##############
+
+    def get_robot_middleware(self):
+        """
+        Get the robot middleware associated with the given robot.
+
+        Returns:
+            RobotMiddleware, None: robot middleware associated with the robot. None, if no middleware was defined.
+        """
+        return self.sim.get_robot_middleware(robot_id=self.id)
+
     ########
     # Base #
     ########
@@ -1385,7 +1398,7 @@ class Robot(ControllableBody):
         simulation.
         """
         # check joint_ids
-        if not joint_ids:
+        if joint_ids is None:
             joint_ids = self.joints
         if isinstance(joint_ids, int):
             joint_ids = [joint_ids]
@@ -1426,8 +1439,9 @@ class Robot(ControllableBody):
         # print("resetting: {}, {}, {}".format(joint_ids, q, dq))
 
         # reset the joint state
-        for joint_id, position, velocity in zip(joint_ids, q, dq):
-            self.sim.reset_joint_state(self.id, joint_id, position, velocity)
+        # for joint_id, position, velocity in zip(joint_ids, q, dq):
+        #     self.sim.reset_joint_state(self.id, joint_id, position, velocity)
+        self.sim.reset_joint_states(body_id=self.id, joint_ids=joint_ids, positions=q, velocities=dq)
 
     def get_home_joint_positions(self):
         r"""
@@ -1435,9 +1449,11 @@ class Robot(ControllableBody):
         the child class.
         """
         if 'home' in self._joint_configuration:
-            joint_ids, joint_values = self._joint_configuration['home']
-            if len(joint_ids) == self.num_actuated_joints:
-                return joint_values
+            # joint_ids, joint_values = self._joint_configuration['home']
+            # if len(joint_ids) == self.num_actuated_joints:
+            #     return joint_values
+            joint_values = self._joint_configuration['home']
+            return joint_values
         return np.zeros(self.num_actuated_joints)
 
     def set_home_joint_positions(self):
@@ -3638,7 +3654,7 @@ class Robot(ControllableBody):
 
         Args:
             q (np.array[float[N]], None): joint positions of size N, where N is the total number of DoFs. If None, it
-                will get the current joint positions.
+              will get the current joint positions.
             q_idx (slice, None): if provided, it will slice the inertia matrix at the given q indices (0 < M <= N).
 
         Returns:

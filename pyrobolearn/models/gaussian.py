@@ -84,9 +84,9 @@ class Gaussian(object):
      forward substitution, and then computing :math:`L^\top x = y` by backward substitution.
 
     References:
-        [1] "Pattern Recognition and Machine Learning", Bishop, 2006
-        [2] "Machine Learning: A Probabilistic Perspective", Murphy, 2012, chap 3 and 4
-        [3] "The Matrix Cookbook", Petersen et al., 2012, sec 8
+        - [1] "Pattern Recognition and Machine Learning", Bishop, 2006
+        - [2] "Machine Learning: A Probabilistic Perspective", Murphy, 2012, chap 3 and 4
+        - [3] "The Matrix Cookbook", Petersen et al., 2012, sec 8
 
     The implementation of this class was inspired by the following codes:
     * `scipy`: https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.stats.multivariate_normal.html
@@ -108,8 +108,8 @@ class Gaussian(object):
         Initialize the multivariate normal distribution on the given manifold.
 
         Args:
-            mean (np.array[D]): mean vector.
-            covariance (np.array[D,D]): covariance matrix.
+            mean (np.array[float[D]]): mean vector.
+            covariance (np.array[float[D,D]]): covariance matrix.
             seed (int): random seed. Useful when sampling.
             manifold (None): By default, it is the Euclidean space.
             N (int, N): the number of data points
@@ -273,12 +273,12 @@ class Gaussian(object):
         the mean vector :math:`\mu`, i.e. :math:`\max_{\mu} p(X | \mu, \Sigma)`.
 
         Args:
-            X (array[N,D]): data matrix of shape NxD (if axis=0) or DxN (if axis=1), where N is the number of samples,
-                and D is the dimensionality of a data point
+            X (np.array[float[N,D]]): data matrix of shape NxD (if axis=0) or DxN (if axis=1), where N is the number
+              of samples, and D is the dimensionality of a data point
             axis (int): axis along which the mean is computed
 
         Returns:
-            float[D]: mean vector
+            np.array[float[D]]: mean vector
         """
         # if manifold is Euclidean
         mean = np.mean(X, axis=axis)
@@ -291,13 +291,13 @@ class Gaussian(object):
         for the covariance matrix :math:`\Sigma`, i.e. :math:`\max_{\Sigma} p(X | \mu, \Sigma)`.
 
         Args:
-            X (array[N,D]): data matrix of shape NxD where N is the number of samples, and D is the dimensionality
-                of a data point
+            X (np.array[float[N,D]]): data matrix of shape NxD where N is the number of samples, and D is the
+              dimensionality of a data point.
             axis (int): axis along which the covariance is computed
             bessels_correction (bool): if True, it will compute the covariance using `1/N-1` instead of `N`.
 
         Returns:
-            float[D,D]: 2D covariance matrix
+            np.array[float[D,D]]: 2D covariance matrix
         """
         # if manifold is Euclidean
         cov = np.cov(X, rowvar=bool(axis), bias=not bessels_correction)
@@ -605,7 +605,7 @@ class Gaussian(object):
         # compute conditional
         c = self.cov[np.ix_(o, i)].dot(np.linalg.inv(self.cov[np.ix_(i, i)]))
         mu = self.mean[o] + c.dot(value - self.mean[i])
-        cov = self.cov[np.ix_(o, o)] - c.dot(self.cov[i, o])
+        cov = self.cov[np.ix_(o, o)] - c.dot(self.cov[np.ix_(i, o)])
         return Gaussian(mu, cov)
 
     def marginalize(self, idx):
@@ -1280,9 +1280,10 @@ def plot_3d_and_2d_countour(gaussians, step=500, bound=10, fig=None, title='', b
     plt.show(block=block)
 
 
-def plot_2d_ellipse(ax, gaussian, color='g', fill=False, plot_2devs=False, plot_arrows=True):
+def plot_2d_ellipse(ax, gaussian, dims, color='g', fill=False, plot_2devs=False, plot_arrows=True):
     # alias
-    g = gaussian
+    g = Gaussian(mean=gaussian.mean[np.ix_(dims)], covariance=gaussian.cov[np.ix_(dims, dims)])
+    # g = gaussian
 
     # compute std deviation and eigenvectors from the gaussian
     std_dev, evecs = g.ellipsoid_axes()
@@ -1311,8 +1312,8 @@ def plot_2d_ellipse(ax, gaussian, color='g', fill=False, plot_2devs=False, plot_
         # compute scaled eigenvectors
         p = std_dev * evecs
         # draw arrows
-        ax.arrow(g.mean[0], g.mean[1], p[0, 0], p[1, 0], length_includes_head=True, head_width=0.15, color='r')
-        ax.arrow(g.mean[0], g.mean[1], p[0, 1], p[1, 1], length_includes_head=True, head_width=0.15, color='r')
+        ax.arrow(g.mean[dims[0]], g.mean[dims[1]], p[0, 0], p[1, 0], length_includes_head=True, head_width=0.15, color='r')
+        ax.arrow(g.mean[dims[0]], g.mean[dims[1]], p[0, 1], p[1, 1], length_includes_head=True, head_width=0.15, color='r')
 
     return ellipse_2std
 

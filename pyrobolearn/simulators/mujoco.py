@@ -46,15 +46,15 @@ import xml.etree.ElementTree as ET  # XML parser
 from xml.dom import minidom  # to print in a pretty way the XML file
 
 # import mesh converter (from .obj to .stl)
-try:
-    import pymesh    # rapid prototyping platform focused on geometry processing
-    # doc: https://pymesh.readthedocs.io/en/latest/user_guide.html
-
-    import pyassimp  # library to import and export various 3d-model-formats
-    # doc: http://www.assimp.org/index.php
-    # github: https://github.com/assimp/assimp
-except ImportError as e:
-    raise ImportError(str(e) + "\nTry to install pymesh pyassimp: `pip install pymesh pyassimp`")
+# try:
+#     import pymesh    # rapid prototyping platform focused on geometry processing
+#     # doc: https://pymesh.readthedocs.io/en/latest/user_guide.html
+#
+#     import pyassimp  # library to import and export various 3d-model-formats
+#     # doc: http://www.assimp.org/index.php
+#     # github: https://github.com/assimp/assimp
+# except ImportError as e:
+#     raise ImportError(str(e) + "\nTry to install pymesh pyassimp: `pip install pymesh pyassimp`")
 
 # import image converter
 from PIL import Image
@@ -117,7 +117,22 @@ class Texture(object):
 
 
 class Body(object):
-    """Body."""
+    """MuJoCo Body
+
+    This class describes a MuJoCo multi-body system. MuJoCo works with vectors, matrices that contains all the
+    variables for the various multi-body systems. So this class allows to remember the corresponding indices
+    associated with this multi-body for each of these MuJoCo vectors / matrices.
+
+    For instance, in MuJoCo, `data.qpos` will return a long vector that contains the position values of all the
+    actuated joints for all the multi-bodies that are loaded in the simulator. So if you have several robots, they are
+    all in that long `data.qpos` vector. It becomes then important to remember the indices that are associated with
+    each multi-body.
+
+    It also keep in memory all the joints and bodies/links data structures that are defined in
+    `pyrobolearn.utils.parsers.robots.data_structures.py`. These data structures are instantiated when parsing the
+    various robotic files (URDF, MuJoCo XML, SDF, etc). From these structures you can instantiated the various
+    information that were present in these files.
+    """
 
     def __init__(self, body_id, body_tag, body):
         """
@@ -146,8 +161,8 @@ class Body(object):
         self.num_dofs = body.num_dofs  # nb of DoFs
         self.q_length = self.num_dofs  # length of q
         self.fixed = body.fixed_base if body.fixed_base is not None else True
-        if not self.fixed:  # if free joint, add 1 because in Mujoco the pose is represented as position vector
-            self.q_length += 1   # (3) + quaternion (4) = 7, so one more than 6 DoFs
+        if not self.fixed:  # if free joint, add 1 because in Mujoco the pose is represented as position vector (3)
+            self.q_length += 1   # + quaternion (4) = 7, so one more than 6 DoFs
 
         # define variables for indices that appears in the various vectors and matrices returned by mjModel and mjData
         self._q_idx0, self._q_idxf = 0, 0  # initial and final q indices
@@ -155,11 +170,13 @@ class Body(object):
         self._j_idx0, self._j_idxf = 0, 0  # initial and final free joint indices
         self._v_idx0, self._v_idxf = 0, 0  # initial and final dq (velocity) indices
         self._q_idx1, self._v_idx1 = 0, 0  # initial q and dq indices (which don't take into account virtual joints)
+        self._u_idx0, self._u_idxf = 0, 0  # initial and final ctrl indices
+        self._u_p_indices = np.array([])  # ctrl ids for position motors (do +1 to get velocities, +2 to get torques)
 
         # keep in memory the body
         # self.body = body
-        self.joints = np.array(body.joints.values())
-        self.links = np.array(body.bodies.values())
+        self.joints = np.array(list(body.joints.values()))
+        self.links = np.array(list(body.bodies.values()))
 
         # compute mapping from joint ids to q indices
         idx, jnt_to_q = 0, []
@@ -169,10 +186,18 @@ class Body(object):
             else:
                 jnt_to_q.append(idx)
                 idx += 1
-        self.jnt_to_q = np.array(jnt_to_q)
+        self.jnt_to_q = np.array(jnt_to_q)  # joint ids to q indices, e.g. [0, -1, -1, 1, 2, -1, 3] (-1 = fixed)
 
         # keep in memory the link ids
 
+        # define variables related to actuators and control
+        self.ctrl_modes = np.array([struct.ControlMode.NULL] * self.num_actuated_joints)  # one for each joint
+        self.gains = None   # original gains
+        self.biases = None  # original biases
+        self.ctrl_limited = None  # original binary vector (nu,) to specify if the control inputs are limited
+        self.force_limited = None  # original binary vector (nu,) to specify if the forces are limited
+        self.ctrl_range = None   # original range of control inputs (nu, 2)
+        self.force_range = None  # original range of forces (nu, 2)
 
     @property
     def num_links(self):
@@ -319,6 +344,67 @@ class Body(object):
                              "to be bigger than 0!")
 
     @property
+    def u_idx0(self):
+        """Return the initial ctrl index."""
+        return self._u_idx0
+
+    @u_idx0.setter
+    def u_idx0(self, u):
+        """Set the initial ctrl index."""
+        u = int(u)
+        if u < 0:
+            raise ValueError("Error while setting the initial ctrl index, this index has to be bigger than 0!")
+        self._u_idx0 = u
+        self._u_idxf = u + 3 * self.num_dofs  # set the final ctrl index (the factor 3 is because we create 3 motors)
+        if not self.fixed:
+            self._u_idxf -= 3 * 6  # remove the first 6 DoFs
+        self._u_p_indices = np.array(range(self._u_idx0, self._u_idxf, 3))
+
+    @property
+    def u_idxf(self):
+        """Return the final ctrl index."""
+        return self._u_idxf
+
+    @u_idxf.setter
+    def u_idxf(self, u):
+        """Set the final ctrl index."""
+        u = int(u)
+        if u < 0:
+            raise ValueError("Error while setting the final body index, this index has to be bigger than 0!")
+        self._u_idxf = u
+        self._u_idx0 = u - 3 * self.num_dofs  # set initial ctrl index (the factor 3 is because we create 3 motors)
+        if not self.fixed:
+            self._u_idx0 += 3 * 6  # remove the first 6 DoFs
+        if self._u_idx0 < 0:
+            raise ValueError("Error while setting the final ctrl index, by computing automatically the initial ctrl "
+                             "index from it, it appears it is smaller than 0. The initial ctrl index has to be bigger "
+                             "than 0!")
+        self._u_p_indices = np.array(range(self._u_idx0, self._u_idxf, 3))
+
+    @property
+    def u_p_indices(self):
+        """Return the ctrl indices for the position motors. To get the velocities, just add +1, and to get the efforts
+        just add +2."""
+        return self._u_p_indices
+
+    @property
+    def u_v_indices(self):
+        """Return the ctrl indices for the velocity motors. To get the positions, just subtract 1, and to get the
+        efforts just add 1."""
+        return self._u_p_indices + 1
+
+    @property
+    def u_e_indices(self):
+        """Return the ctrl indices for the effort (torque/force) motors. To get the positions, just subtract 2, and
+        to get the velocities, subtract 1."""
+        return self._u_p_indices + 2
+
+    @property
+    def num_ctrl_inputs(self):
+        """Return the number of control inputs."""
+        return self._u_idxf - self._u_idx0
+
+    @property
     def name(self):
         """Return the body name."""
         # note that we remove the generated prefix and suffix by the parser/generator
@@ -330,25 +416,52 @@ class Body(object):
         return self.tag.attrib.get("name")
 
     def get_q_idx(self, joint_id, keep=False):
+        """
+        Return the q index(ices) associated with the given joint id(s). The indices are between -1 and the number of
+        actuated joints. If the provided `keep` argument is True, then it will return also the q indices for the
+        fixed joints. By default, for the fixed joints, the corresponding q index is set to -1.
+
+        For instance, if we have a body with 5 joints such that in the order we have 1 revolute, 2 fixed, and 2
+        revolute joints, the method `get_q_idx` (with `keep=True` and specifying all the joint ids even the fixed
+        ones) will return [0, -1, -1, 1, 2]. If `keep=False`, then it will return [0, 1, 2].
+
+        Args:
+            joint_id (np.array[int], int): joint id(s) (each joint id should be between [0, num_joints[).
+            keep (bool): if True, keep the fixed joints.
+
+        Returns:
+            np.array[int], int, None: q index(ices) associated with the given joint id(s).
+        """
         q = self.jnt_to_q[joint_id]
         if keep:  # keep fixed joints (-1)
             return q
-        if isinstance(q, float):
+        if isinstance(q, int):
             if q != -1:
                 return q
             return None
         return q[q != -1]  # remove fixed joints
 
     def get_dq_idx(self, joint_id, keep=False):
+        """Return the dq index(ices) associated with the given joint id(s).
+
+        Args:
+            joint_id (np.array[int], int): joint id(s) (each joint id should be between [0, num_joints[).
+            keep (bool): if True, keep the fixed joints.
+
+        Returns:
+            np.array[int], int, None: dq index(ices) associated with the given joint id(s).
+        """
         return self.get_q_idx(joint_id, keep)
 
     def get_joint(self, joint_id):
+        """Get the joint data structure from the joint id (which is between [0, num_joints[)."""
         return self.joints[joint_id]
 
     def get_joint_type(self, joint_id):
         return self.joints[joint_id].dtype
 
     def get_link(self, link_id):
+        """Get the link data structure from the link id (which is between [0, num_links[)."""
         return self.links[link_id]
 
     def transform_inertial_frame_to_joint_frame(self, body_id):
@@ -373,6 +486,10 @@ class Body(object):
 
 
 class StateIndices(object):
+    """Mujoco state indices.
+
+    This class allows to remember the indices associated with a given state.
+    """
 
     def __init__(self):
         self.qpos = None
@@ -468,6 +585,7 @@ class Mujoco(Simulator):
         self._joint_cnt = 0
         self._link_cnt = 1    # this is the number of bodies (=links) in Mujoco, 0 is for the worldbody.
         self._mjc_body_id = 0
+        self._ctrl_cnt = 0  # this is for the motors
 
         self.default_timestep = 0.002
         self.dt = self.default_timestep
@@ -566,8 +684,6 @@ class Mujoco(Simulator):
         Instantiate the model, simulator, and viewer.
 
         Args:
-            root (str, ET.Element, None): xml string containing the definition of the Mujoco file, or root XML element.
-              If None, it will take the root defined in the simulator.
             render (bool): if we should render or not.
         """
         # self.render(enable=False)  # to delete the previous viewer instance if defined
@@ -596,6 +712,16 @@ class Mujoco(Simulator):
 
     @staticmethod
     def _check_joint_id(body, joint_id):
+        """
+        Check that the given joint_id are between [0, num_joints[.
+
+        Args:
+            body (Body): MuJoCo body instance.
+            joint_id (int): unique joint id.
+
+        Returns:
+            int: joint id (same as the one given as input).
+        """
         if not isinstance(joint_id, int):
             raise TypeError("Expecting the given joint id to be an int, but got instead: {}".format(type(joint_id)))
         if joint_id < 0 or joint_id > (body.num_joints - 1):
@@ -604,6 +730,16 @@ class Mujoco(Simulator):
 
     @staticmethod
     def _check_joint_ids(body, joint_ids):
+        """
+        Check that all the given joint ids are between [0, num_joints[.
+
+        Args:
+            body (Body): MuJoCo body instance.
+            joint_ids (np.array[int], int): unique joint ids.
+
+        Returns:
+            np.array[int], int: joint id(s) (same as the ones given as inputs).
+        """
         joint_ids = np.asarray(joint_ids)
         if np.any(joint_ids < 0) or np.any(joint_ids > (body.num_joints - 1)):
             raise ValueError("joint_ids should belong to [0, {}], but got: {}".format(body.num_joints - 1, joint_ids))
@@ -613,6 +749,17 @@ class Mujoco(Simulator):
 
     @staticmethod
     def _check_link_id(body, link_id):
+        """
+        Check that the given link_id is between [-1, num_links-2], and return the converted link id such that
+        it is between [0, num_links-1].
+
+        Args:
+            body (Body): MuJoCo body instance.
+            link_id (int): unique link id.
+
+        Returns:
+            int: converted link id
+        """
         if not isinstance(link_id, int):
             raise TypeError("Expecting the given link id to be an int, but got instead: {}".format(type(link_id)))
         if link_id < -1 or link_id > (body.num_bodies - 2):  # -1 is for the base
@@ -621,6 +768,17 @@ class Mujoco(Simulator):
 
     @staticmethod
     def _check_link_ids(body, link_ids):
+        """
+        Check that the given link_ids are between [-1, num_links-2], and return the converted link ids such that
+        they are between [0, num_links-1].
+
+        Args:
+            body (Body): MuJoCo body instance.
+            link_ids (np.array[int], int): unique link id(s).
+
+        Returns:
+            np.array[int], int: converted link id(s).
+        """
         link_ids = np.asarray(link_ids)
         if np.any(link_ids < -1) or np.any(link_ids > (body.num_bodies - 2)):  # -1 is for the base
             raise ValueError("link_ids should belong to [-1, {}], but got: {}".format(body.num_bodies - 2, link_ids))
@@ -630,6 +788,15 @@ class Mujoco(Simulator):
 
     @staticmethod
     def _get_joint_type_id(joint_type):
+        """
+        Return the joint type id given the joint type string.
+
+        Args:
+            joint_type (str): joint type string.
+
+        Returns:
+            int: unique joint type id.
+        """
         if joint_type == 'fixed':
             return Simulator.JOINT_FIXED
         if joint_type == 'revolute':
@@ -647,11 +814,37 @@ class Mujoco(Simulator):
 
     @staticmethod
     def _process_name(name):
+        """
+        Process the given name. By default, the MuJoCo parser add the prefix `prl_` and the suffix `_str(cnt)`.
+        This is to avoid collisions between different names and making them unique. Here, we remove these prefix and
+        suffix and return the original name (of the joint/body).
+
+        Args:
+            name (str): name with a possible prefix `prl_` and suffix `_str(cnt)`.
+
+        Returns:
+            str: processed name.
+        """
         if name.startswith('prl_'):
             return '_'.join(name.split('_')[1:-1])
         return name
 
     def _save_state(self):
+        """Save current mujoco state.
+
+        Returns:
+            float: current time step
+            np.array[float[nq]]: joint positions
+            np.array[float[nv]]: joint velocities
+            np.array[float[na]], None: actuator activation
+            np.array[float[nmocap,3]]: positions of mocap bodies
+            np.array[float[nmocap,4]]: orientations of mocap bodies
+            np.array[float[nuserdata]]: user data (not touched by engine)
+            np.array[float[nv]]: acceleration used for warm start
+
+        References:
+            - http://www.mujoco.org/book/programming.html#siStateControl
+        """
         # check: http://www.mujoco.org/book/programming.html#siStateControl
 
         # copy simulation state
@@ -671,11 +864,25 @@ class Mujoco(Simulator):
         return t, qpos, qvel, act, mocap_pos, mocap_quat, userdata, qacc_warmstart
 
     def _clear_control(self):
-        self.sim.data.ctrl[:] = 0
-        self.sim.data.qfrc_applied[:] = 0
-        self.sim.data.xfrc_applied[:, :] = 0
+        """Clear the control vector in Mujoco given by u = (data.ctrl, data.qfrc_applied, data.xfrc_applied)
+        where `ctrl` are the control signals for the actuators, `qfrc_applied` are the applied generalized forces
+        in the joint space, and `xfrc_applied` are the applied Cartesian force/torque.
+
+        References:
+            - http://www.mujoco.org/book/programming.html#siStateControl
+        """
+        self.sim.data.ctrl[:] = 0  # (nu,)
+        self.sim.data.qfrc_applied[:] = 0  # (nv,)
+        self.sim.data.xfrc_applied[:, :] = 0  # (nbody, 6)
 
     def _load_state(self, state, indices=None):
+        """
+        Load and set the given mujoco state.
+
+        Args:
+            state (list, tuple): the state returned by `_save_state()` method.
+            indices (None, StateIndices): indices of the state to change in the whole MuJoCo state vector.
+        """
         t, qpos, qvel, act, mocap_pos, mocap_quat, userdata, qacc_warmstart = state
         if indices is None:
             indices = self._state_indices
@@ -744,6 +951,12 @@ class Mujoco(Simulator):
     # Simulators #
     ##############
 
+    def print_xml(self):
+        """
+        Print the generated MuJoCo XML file that is currently in memory.
+        """
+        print(self._parser.get_string(pretty_format=True))
+
     def reset(self):
         """Reset the simulator.
 
@@ -784,21 +997,21 @@ class Mujoco(Simulator):
                 self.viewer = mujoco.MjViewer(self.sim)
             self.viewer.render()
 
-            # select with the mouse
-            coordinates = np.zeros(3)
-            geomid, skin = 0, 0
-
-            # mouse selection.
-            mujoco.functions.mjv_select(self.model, self.sim.data, self.viewer.vopt, aspectratio, relx, rely,
-                                        self.viewer.scn, coordinates, geomid, skin)
-
-            # Move perturb object with mouse; action is mjtMouse.
-            action = 0
-            mujoco.functions.mjv_movePerturb(self.model, self.sim.data, action, reldx, reldy, self.viewer.scn,
-                                             self.viewer.pert)
-
-            # Set perturb force,torque in d->xfrc_applied, if selected body is dynamic.
-            mujoco.functions.mjv_applyPerturbForce(self.model, self.sim.data, self.viewer.pert)
+            # # select with the mouse
+            # coordinates = np.zeros(3)
+            # geomid, skin = 0, 0
+            #
+            # # mouse selection.
+            # mujoco.functions.mjv_select(self.model, self.sim.data, self.viewer.vopt, aspectratio, relx, rely,
+            #                             self.viewer.scn, coordinates, geomid, skin)
+            #
+            # # Move perturb object with mouse; action is mjtMouse.
+            # action = 0
+            # mujoco.functions.mjv_movePerturb(self.model, self.sim.data, action, reldx, reldy, self.viewer.scn,
+            #                                  self.viewer.pert)
+            #
+            # # Set perturb force,torque in d->xfrc_applied, if selected body is dynamic.
+            # mujoco.functions.mjv_applyPerturbForce(self.model, self.sim.data, self.viewer.pert)
 
         # sleep the specified amount of time
         # time.sleep(sleep_time)
@@ -896,10 +1109,10 @@ class Mujoco(Simulator):
 
         Args:
             filename (None, str): path to file to store the state of the simulator. If None, it will save it in
-                memory instead of the disk.
+              memory instead of the disk.
 
         Returns:
-            int / str: unique state id, or filename. This id / filename can be used to load the state.
+            int, str: unique state id, or filename. This id / filename can be used to load the state.
         """
         id_ = None
         if filename is None:
@@ -956,6 +1169,15 @@ class Mujoco(Simulator):
         Returns:
             int (non-negative): unique id associated to the load model.
         """
+        # check
+        path = os.path.abspath(filename)  # /path/to/pyrobolearn/robots/urdfs/<robot>/robot.urdf
+        dirname = str(os.path.dirname(path))  # /path/to/pyrobolearn/robots/urdfs/<robot>/
+        basename = str(os.path.basename(path).split('.')[-2])  # robot name without extension
+
+        new_path = dirname + '/' + basename + '_mujoco.urdf'
+        if os.path.exists(new_path):
+            filename = new_path
+
         # parse URDF file
         urdf_parser = URDFParser(filename=filename)
         tree = urdf_parser.tree
@@ -1150,6 +1372,8 @@ class Mujoco(Simulator):
         self._joint_cnt += body.num_free_joints
         body.v_idx0 = self._dq_cnt
         self._dq_cnt += body.num_dofs
+        body.u_idx0 = self._ctrl_cnt
+        self._ctrl_cnt += body.num_ctrl_inputs
 
         # update mujoco model if necessary
         self._update_sim()
@@ -1157,6 +1381,24 @@ class Mujoco(Simulator):
         # if verbose, print current xml file
         if verbose > 1:
             print(self._parser.get_string(pretty_format=True))
+
+        # save default gain and bias parameters, control inputs range, and force range
+        body.gains = self.model.actuator_gainprm[body.u_idx0:body.u_idxf]
+        body.biases = self.model.actuator_biasprm[body.u_idx0:body.u_idxf]
+        body.ctrl_limited = self.model.actuator_ctrllimited[body.u_idx0:body.u_idxf]
+        body.force_limited = self.model.actuator_forcelimited[body.u_idx0:body.u_idxf]
+        body.ctrl_range = self.model.actuator_ctrlrange[body.u_idx0:body.u_idxf]
+        body.force_range = self.model.actuator_forcerange[body.u_idx0:body.u_idxf]
+
+        # print("Creating body with the following gains: ")
+        # print("Position gain = {}, bias = {}".format(self.model.actuator_gainprm[body.u_p_indices],
+        #                                              self.model.actuator_biasprm[body.u_p_indices]))
+        # print("Velocity gain = {}, bias = {}".format(self.model.actuator_gainprm[body.u_v_indices],
+        #                                              self.model.actuator_biasprm[body.u_v_indices]))
+        # print("Effort gain = {}, bias = {}".format(self.model.actuator_gainprm[body.u_e_indices],
+        #                                            self.model.actuator_biasprm[body.u_e_indices]))
+        # print("Force limited?: ", self.model.actuator_forcelimited[body.u_p_indices])
+        # print("Force range = ", self.model.actuator_forcerange[body.u_p_indices])
 
         # return body id
         return body_id
@@ -1949,7 +2191,7 @@ class Mujoco(Simulator):
         joint_id = self._check_joint_id(body, joint_id)
         q = body.get_q_idx(joint_id, keep=True)
         if q != -1:
-            self.model.qpos0[body.q_idx1 + q] = position
+            self.model.qpos0[body.q_idx1 + q] = -position
             # self.sim.data.qpos[body.q_idx1 + q] = position
             if velocity is not None:
                 self.sim.data.qvel[body.v_idx1 + q] = velocity
@@ -1965,16 +2207,18 @@ class Mujoco(Simulator):
             positions (np.array[float]): the joint positions (angle in radians [rad] or position [m])
             velocities (np.array[float]): the joint velocities (angular [rad/s] or linear velocity [m/s])
         """
+        # WARNING: the angles are reversed when setting qpos0 instead of qpos!!
         body = self._bodies[body_id]
         if joint_ids is None:
-            self.model.qpos0[body.q_idx1:body.q_idxf] = positions
+            # self.model.qpos0[body.q_idx1:body.q_idxf] = -positions
+            self.sim.data.qpos[body.q_idx1:body.q_idxf] = positions
         else:
             joint_ids = self._check_joint_ids(body, joint_ids)
             q = body.get_q_idx(joint_ids, keep=False)
             if q is None:
                 return
-            self.model.qpos0[body.q_idx1 + q] = positions
-            # self.sim.data.qpos[body.q_idx1 + q] = positions
+            # self.model.qpos0[body.q_idx1 + q] = -positions
+            self.sim.data.qpos[body.q_idx1 + q] = positions
             if velocities is not None:
                 self.sim.data.qvel[body.v_idx1 + q] = velocities
 
@@ -2574,43 +2818,114 @@ class Mujoco(Simulator):
             kds (None, float, np.array[float[N]]): velocity gain(s)
             forces (None, float, np.array[float[N]]): maximum motor force(s)/torque(s) used to reach the target values.
         """
-        # TODO: use the other arguments
+        # body = self._bodies[body_id]
+        #
+        # q = self.get_joint_positions(body_id, joint_ids=joint_ids)
+        # qvel= self.get_joint_velocities(body_id, joint_ids=joint_ids)
+        #
+        # if kps is None:
+        #     kps = 1000.
+        # if kds is None:
+        #     kds = 1.
+        # if velocities is None:
+        #     velocities = 0.
+        #
+        # tau = kps * (positions - q) + kds * (velocities - qvel)
+        #
+        # if joint_ids is None:
+        #     # self.sim.data.qpos[body.q_idx1:body.q_idxf] = positions
+        #     c_q_dq = self.sim.data.qfrc_bias[body.v_idx1:body.v_idxf]
+        #     # self.sim.data.qfrc_applied[body.v_idx1:body.v_idxf] = tau + c_q_dq  # DEPRECATED
+        #     self.sim.data.qfrc_actuator[body.v_idx1:body.v_idxf] = tau + c_q_dq
+        #
+        # else:
+        #     # check if valid joints
+        #     self._check_joint_ids(body, joint_ids)
+        #
+        #     # if one joint, set its position
+        #     if isinstance(joint_ids, int):
+        #         # self.sim.data.qpos[body.q_idx1 + joint_ids] = positions
+        #         c_q_dq = self.sim.data.qfrc_bias[body.v_idx1 + joint_ids]
+        #         # self.sim.data.qfrc_applied[body.v_idx1 + joint_ids] = tau + c_q_dq  # DEPRECATED
+        #         self.sim.data.qfrc_actuator[body.v_idx1 + joint_ids] = tau + c_q_dq
+        #
+        #     # if multiple joints, set their positions
+        #     else:
+        #         q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        #
+        #         # self.sim.data.qpos[body.q_idx1 + q[q != -1]] = positions
+        #         c_q_dq = self.sim.data.qfrc_bias[body.v_idx1 + q[q != -1]]
+        #         # self.sim.data.qfrc_applied[body.v_idx1 + q[q != -1]] = tau + c_q_dq  # DEPRECATED
+        #         self.sim.data.qfrc_actuator[body.v_idx1 + q[q != -1]] = tau + c_q_dq
 
+        # get body and q indices
         body = self._bodies[body_id]
-
-        q = self.get_joint_positions(body_id, joint_ids=joint_ids)
-        qvel= self.get_joint_velocities(body_id, joint_ids=joint_ids)
-
-        if kps is None:
-            kps = 1000.
-        if kds is None:
-            kds = 1.
-        if velocities is None:
-            velocities = 0.
-
-        tau = kps * (positions - q) + kds * (velocities - qvel)
-
         if joint_ids is None:
-            # self.sim.data.qpos[body.q_idx1:body.q_idxf] = positions
-            c_q_dq = self.sim.data.qfrc_bias[body.v_idx1:body.v_idxf]
-            self.sim.data.qfrc_applied[body.v_idx1:body.v_idxf] = tau + c_q_dq
-
+            q_idx = np.array(range(body.num_actuated_joints))
         else:
             # check if valid joints
             self._check_joint_ids(body, joint_ids)
 
-            # if one joint, set its torque
-            if isinstance(joint_ids, int):
-                # self.sim.data.qpos[body.q_idx1 + joint_ids] = positions
-                c_q_dq = self.sim.data.qfrc_bias[body.v_idx1 + joint_ids]
-                self.sim.data.qfrc_applied[body.v_idx1 + joint_ids] = tau + c_q_dq
+            q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+            q_idx = q_idx[q_idx != -1]
 
-            # if multiple joints, set their torques
-            q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        if len(q_idx) == 0:
+            raise ValueError("No actuated joints to set the positions to...")
 
-            # self.sim.data.qpos[body.q_idx1 + q[q != -1]] = positions
-            c_q_dq = self.sim.data.qfrc_bias[body.v_idx1 + q[q != -1]]
-            self.sim.data.qfrc_applied[body.v_idx1 + q[q != -1]] = tau + c_q_dq
+        # set gains
+        if kps is not None:
+            self.model.actuator_gainprm[body.u_p_indices[q_idx], 0] = kps  # for desired positions
+            self.model.actuator_biasprm[body.u_p_indices[q_idx], 1] = -kps  # for current positions
+        if kds is not None:
+            if velocities is not None:
+                self.model.actuator_gainprm[body.u_v_indices[q_idx], 0] = kds  # for desired velocities
+            self.model.actuator_biasprm[body.u_v_indices[q_idx], 2] = -kds  # for current velocities
+
+        # check the current control mode, deactivate the other motors by setting their gains and biases to zero
+        if velocities is None and np.any(body.ctrl_modes[q_idx] != struct.ControlMode.POSITION):
+            # Switch to position control mode
+            body.ctrl_modes[q_idx] = struct.ControlMode.POSITION
+
+            body_p_indices = body.u_p_indices - body.u_idx0
+            if kps is None:  # if gains were not provided, set back to the default ones
+                self.model.actuator_gainprm[body.u_p_indices[q_idx], 0] = body.gains[body_p_indices[q_idx], 0]
+                self.model.actuator_biasprm[body.u_p_indices[q_idx], 1] = body.biases[body_p_indices[q_idx], 1]
+            self.model.actuator_gainprm[body.u_v_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_v_indices[q_idx]] = 0
+            self.model.actuator_gainprm[body.u_e_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_e_indices[q_idx]] = 0
+        elif velocities is not None and np.any(body.ctrl_mode[q_idx] != struct.ControlMode.PD):
+            # Switch to PD control mode
+            body.ctrl_modes[q_idx] = struct.ControlMode.PD
+
+            body_p_indices = body.u_p_indices - body.u_idx0
+            body_v_indices = body_p_indices + 1
+            if kps is None:  # if gains were not provided, set back to the default ones
+                self.model.actuator_gainprm[body.u_p_indices[q_idx], 0] = body.gains[body_p_indices[q_idx], 0]
+                self.model.actuator_biasprm[body.u_p_indices[q_idx], 1] = body.biases[body_p_indices[q_idx], 1]
+            if kds is None:  # if gains were not provided, set back to the default ones
+                self.model.actuator_gainprm[body.u_v_indices[q_idx], 0] = body.gains[body_v_indices[q_idx], 0]
+                self.model.actuator_biasprm[body.u_v_indices[q_idx], 2] = body.gains[body_v_indices[q_idx], 2]
+            self.model.actuator_gainprm[body.u_e_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_e_indices[q_idx]] = 0
+
+        # set max forces
+        if forces is None:  # TODO: improve this part
+            body_p_indices = body.u_p_indices - body.u_idx0
+            self.model.actuator_forcelimited[body.u_p_indices[q_idx]] = body.force_limited[body_p_indices[q_idx]]
+            self.model.actuator_forcerange[body.u_p_indices[q_idx], 0] = -body.force_range[body_p_indices[q_idx], 0]
+            self.model.actuator_forcerange[body.u_p_indices[q_idx], 1] = body.force_range[body_p_indices[q_idx], 1]
+        else:
+            self.model.actuator_forcelimited[body.u_p_indices[q_idx]] = 1
+            self.model.actuator_forcerange[body.u_p_indices[q_idx], 0] = -forces
+            self.model.actuator_forcerange[body.u_p_indices[q_idx], 1] = forces
+
+        # set joint positions
+        self.sim.data.ctrl[body.u_p_indices[q_idx]] = positions
+
+        # set joint velocities if specified as well
+        if velocities is not None:
+            self.sim.data.ctrl[body.u_v_indices[q_idx]] = velocities
 
     def get_joint_positions(self, body_id, joint_ids=None):
         """
@@ -2640,9 +2955,9 @@ class Mujoco(Simulator):
             return self.sim.data.qpos[body.q_idx1 + joint_ids]
 
         # if multiple joints, return their positions
-        q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
         qpos = np.zeros(len(joint_ids))
-        qpos[q != -1] = self.sim.data.qpos[body.q_idx1 + q[q != -1]]
+        qpos[q_idx != -1] = self.sim.data.qpos[body.q_idx1 + q_idx[q_idx != -1]]
         return qpos
 
     def set_joint_velocities(self, body_id, joint_ids, velocities, max_force=None):
@@ -2655,23 +2970,57 @@ class Mujoco(Simulator):
             velocities (float, np.array[float[N]]): desired velocity, or list of desired velocities [rad/s]
             max_force (None, float, np.array[float[N]]): maximum motor forces/torques
         """
-        # TODO: use the other arguments
+        # body = self._bodies[body_id]
+        # 
+        # if joint_ids is None:
+        #     self.sim.data.qvel[body.v_idx1:body.v_idxf] = velocities
+        # else:
+        #     # check if valid joints
+        #     self._check_joint_ids(body, joint_ids)
+        # 
+        #     # if one joint, set its velocity
+        #     if isinstance(joint_ids, int):
+        #         self.sim.data.qvel[body.v_idx1 + joint_ids] = velocities
+        # 
+        #     # if multiple joints, set their velocities
+        #     else:
+        #         q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        #         self.sim.data.qvel[body.v_idx1 + q[q != -1]] = velocities
 
+        # get body and q indices
         body = self._bodies[body_id]
-
         if joint_ids is None:
-            self.sim.data.qvel[body.v_idx1:body.v_idxf] = velocities
+            q_idx = np.array(range(body.num_actuated_joints))
         else:
             # check if valid joints
             self._check_joint_ids(body, joint_ids)
 
-            # if one joint, set its torque
-            if isinstance(joint_ids, int):
-                self.sim.data.qvel[body.v_idx1 + joint_ids] = velocities
+            q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+            q_idx = q_idx[q_idx != -1]
 
-            # if multiple joints, set their torques
-            q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
-            self.sim.data.qvel[body.v_idx1 + q[q != -1]] = velocities
+        if len(q_idx) == 0:
+            raise ValueError("No actuated joints to set the velocities to...")
+
+        # check the current control mode, deactivate the other motors by setting their gains and biases to zero
+        if np.any(body.ctrl_modes[q_idx] != struct.ControlMode.VELOCITY):
+            # Switch to velocity control mode
+            body.ctrl_modes[q_idx] = struct.ControlMode.VELOCITY
+            body_v_indices = body.u_v_indices - body.u_idx0
+            self.model.actuator_gainprm[body.u_p_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_p_indices[q_idx]] = 0
+            self.model.actuator_gainprm[body.u_v_indices[q_idx], 0] = body.gains[body_v_indices[q_idx], 0]
+            self.model.actuator_biasprm[body.u_v_indices[q_idx], 2] = body.biases[body_v_indices[q_idx], 2]
+            self.model.actuator_gainprm[body.u_e_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_e_indices[q_idx]] = 0
+
+        if max_force is not None:
+            self.model.actuator_forcelimited[body.u_v_indices[q_idx]] = 1
+            self.model.actuator_forcerange[body.u_v_indices[q_idx], 0] = -max_force
+            self.model.actuator_forcerange[body.u_v_indices[q_idx], 1] = max_force
+        # TODO: reset force range when None
+
+        # set joint velocities
+        self.sim.data.ctrl[body.u_v_indices[q_idx]] = velocities
 
     def get_joint_velocities(self, body_id, joint_ids=None):
         """
@@ -2700,9 +3049,9 @@ class Mujoco(Simulator):
             return self.sim.data.qvel[body.v_idx1 + joint_ids]
 
         # if multiple joints, return their velocities
-        q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
         qvel = np.zeros(len(joint_ids))
-        qvel[q != -1] = self.sim.data.qvel[body.v_idx1 + q[q != -1]]
+        qvel[q_idx != -1] = self.sim.data.qvel[body.v_idx1 + q_idx[q_idx != -1]]
         return qvel
 
     def set_joint_accelerations(self, body_id, joint_ids, accelerations, q=None, dq=None):
@@ -2745,9 +3094,9 @@ class Mujoco(Simulator):
             return self.sim.data.qacc[body.v_idx1 + joint_ids]
 
         # if multiple joints, return their velocities
-        q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
         qacc = np.zeros(len(joint_ids))
-        qacc[q != -1] = self.sim.data.qacc[body.v_idx1 + q[q != -1]]
+        qacc[q_idx != -1] = self.sim.data.qacc[body.v_idx1 + q_idx[q_idx != -1]]
         return qacc
 
     def set_joint_torques(self, body_id, joint_ids, torques):
@@ -2759,21 +3108,58 @@ class Mujoco(Simulator):
             joint_ids (int, list[int]): joint id, or list of joint ids.
             torques (float, list[float], np.array[float]): desired torque(s) to apply to the joint(s) [N].
         """
-        body = self._bodies[body_id]
+        # body = self._bodies[body_id]
+        #
+        # if joint_ids is None:
+        #     self.sim.data.qfrc_applied[body.v_idx1:body.v_idxf] = torques
+        # else:
+        #     # check if valid joints
+        #     self._check_joint_ids(body, joint_ids)
+        #
+        #     # if one joint, set its torque
+        #     if isinstance(joint_ids, int):
+        #         self.sim.data.qfrc_applied[body.v_idx1 + joint_ids] = torques
+        #
+        #     # if multiple joints, set their torques
+        #     else:
+        #         q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        #         self.sim.data.qfrc_applied[body.v_idx1 + q[q != -1]] = torques
 
+        body = self._bodies[body_id]
         if joint_ids is None:
-            self.sim.data.qfrc_applied[body.v_idx1:body.v_idxf] = torques
+            q_idx = np.array(range(body.num_actuated_joints))
         else:
             # check if valid joints
             self._check_joint_ids(body, joint_ids)
 
-            # if one joint, set its torque
-            if isinstance(joint_ids, int):
-                self.sim.data.qfrc_applied[body.v_idx1 + joint_ids] = torques
+            q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+            q_idx = q_idx[q_idx != -1]
 
-            # if multiple joints, set their torques
-            q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
-            self.sim.data.qfrc_applied[body.v_idx1 + q[q != -1]] = torques
+        if len(q_idx) == 0:
+            raise ValueError("No actuated joints to set the torques to...")
+
+        # check the current control mode, deactivate the other motors by setting their gains and biases to zero
+        if np.any(body.ctrl_modes != struct.ControlMode.EFFORT):
+            # Switch to effort control mode
+            body.ctrl_modes[q_idx] = struct.ControlMode.EFFORT
+            body_e_indices = body.u_e_indices - body.u_idx0
+            self.model.actuator_gainprm[body.u_p_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_p_indices[q_idx]] = 0
+            self.model.actuator_gainprm[body.u_v_indices[q_idx]] = 0
+            self.model.actuator_biasprm[body.u_v_indices[q_idx]] = 0
+            self.model.actuator_gainprm[body.u_e_indices[q_idx], 0] = body.gains[body_e_indices[q_idx], 0]
+            self.model.actuator_biasprm[body.u_e_indices[q_idx]] = 0
+
+            # reset to original control and force ranges
+            self.model.actuator_ctrllimited[body.u_e_indices[q_idx]] = body.ctrl_limited[body_e_indices[q_idx]]
+            self.model.actuator_ctrlrange[body.u_e_indices[q_idx], 0] = body.ctrl_range[body_e_indices[q_idx], 0]
+            self.model.actuator_ctrlrange[body.u_e_indices[q_idx], 1] = body.ctrl_range[body_e_indices[q_idx], 1]
+            self.model.actuator_forcelimited[body.u_e_indices[q_idx]] = body.force_limited[body_e_indices[q_idx]]
+            self.model.actuator_forcerange[body.u_e_indices[q_idx], 0] = body.force_range[body_e_indices[q_idx], 0]
+            self.model.actuator_forcerange[body.u_e_indices[q_idx], 1] = body.force_range[body_e_indices[q_idx], 1]
+
+        # set joint efforts (torques/forces)
+        self.sim.data.ctrl[body.u_e_indices[q_idx]] = torques
 
     def get_joint_torques(self, body_id, joint_ids=None):
         """
@@ -2802,9 +3188,9 @@ class Mujoco(Simulator):
             return self.sim.data.qfrc_applied[body.v_idx1 + joint_ids]
 
         # if multiple joints, return their velocities
-        q = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
+        q_idx = body.get_q_idx(joint_ids, keep=True)  # E.g. [0, -1, 1, -1, 2, 3]  (-1 are for fixed joints)
         torques = np.zeros(len(joint_ids))
-        torques[q != -1] = self.sim.data.qfrc_applied[body.v_idx1 + q[q != -1]]
+        torques[q_idx != -1] = self.sim.data.qfrc_applied[body.v_idx1 + q_idx[q_idx != -1]]
         return torques
 
     def get_joint_reaction_forces(self, body_id, joint_ids=None):
